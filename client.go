@@ -28,6 +28,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/davly/delve-go/internal/boundarysigner"
 )
 
 // DefaultURL is the default URL the SDK falls back to when neither
@@ -47,6 +49,17 @@ type ClientOptions struct {
 	APIKey     string       // iik_... key for HMAC signing. R175 LOAD-BEARING: empty rejected.
 	TenantID   string       // R121 multi-tenant cohort key. Empty rejected.
 	HTTPClient *http.Client // optional override (default: 30s timeout).
+
+	// BoundarySignerKey enables R191 boundary-signing of outbound requests. OPT-IN: when empty (the
+	// default) requests are sent exactly as before — no X-Boundary-Signature header, byte-identical wire.
+	// When non-empty, Search attaches an X-Boundary-Signature mark (HMAC-SHA256 over
+	// versionTag||CorpusSHA||payload) so a verifier can authenticate the request boundary. The server-side
+	// verifier is the operator's deploy (the delve service binary is TODO per R155); this is the
+	// ready client half + a frozen wire contract.
+	BoundarySignerKey []byte
+	// CorpusSHA is the 32-byte cohort/project corpus identifier mixed into the boundary signature. The zero
+	// value (32 zero bytes) is the KAT-1 canonical corpus; production deployments override it.
+	CorpusSHA [32]byte
 }
 
 // Client wraps the delve HTTP API.
@@ -55,6 +68,7 @@ type Client struct {
 	apiKey     string
 	tenantID   string
 	httpClient *http.Client
+	signer     *boundarysigner.Signer // nil unless ClientOptions.BoundarySignerKey was set (opt-in R191)
 }
 
 // NewClient constructs a delve SDK client. URL defaults to DELVE_URL env var
@@ -79,7 +93,17 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if hc == nil {
 		hc = &http.Client{Timeout: DefaultTimeout}
 	}
-	return &Client{url: url, apiKey: opts.APIKey, tenantID: opts.TenantID, httpClient: hc}, nil
+	c := &Client{url: url, apiKey: opts.APIKey, tenantID: opts.TenantID, httpClient: hc}
+	// R191 boundary-signing is opt-in: only construct a signer when a key is supplied. With no key the
+	// signer stays nil and the wire is byte-identical to an unsigned client.
+	if len(opts.BoundarySignerKey) > 0 {
+		signer, err := boundarysigner.NewSigner(opts.BoundarySignerKey, opts.CorpusSHA)
+		if err != nil {
+			return nil, fmt.Errorf("delve: boundary signer: %w", err)
+		}
+		c.signer = signer
+	}
+	return c, nil
 }
 
 // URL returns the configured service URL. Exposed for diagnostics +
@@ -111,7 +135,8 @@ type SearchResponse struct {
 }
 
 // Search performs a search query against the delve service.
-// Boundary-signed via internal/boundarysigner per R191.
+// R191 boundary signature (over the JSON body) is attached as X-Boundary-Signature
+// ONLY when the client was constructed with a BoundarySignerKey; otherwise unsigned.
 func (c *Client) Search(ctx context.Context, q SearchQuery) (*SearchResponse, error) {
 	body, err := json.Marshal(q)
 	if err != nil {
@@ -126,6 +151,9 @@ func (c *Client) Search(ctx context.Context, q SearchQuery) (*SearchResponse, er
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("X-Tenant-ID", c.tenantID)
 	req.Header.Set("User-Agent", "delve-go/0.1")
+	if c.signer != nil {
+		req.Header.Set("X-Boundary-Signature", c.signer.Sign(body))
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("delve: http: %w", err)
